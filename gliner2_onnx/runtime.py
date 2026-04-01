@@ -31,7 +31,8 @@ from .constants import (
     Precision,
 )
 from .exceptions import ConfigurationError, ModelNotFoundError
-from .types import Entity, GLiNER2Config, OnnxModelFiles
+from .schema import Schema
+from .types import Entity, ExtractionResult, GLiNER2Config, OnnxModelFiles
 
 
 def _validate_precision(onnx_files: dict[str, OnnxModelFiles], precision: str) -> OnnxModelFiles:
@@ -547,6 +548,227 @@ class GLiNER2ONNXRuntime:
         entities = self._collect_entities(scores, word_span_start, word_span_end, word_offsets, labels, text, threshold)
 
         return self._deduplicate_entities(entities)
+
+    def create_schema(self) -> Schema:
+        """Return a new empty Schema for multi-task extraction."""
+        return Schema()
+
+    def extract(self, text: str, schema: Schema) -> ExtractionResult:
+        """
+        Run multi-task extraction (NER + classification) in a single encoder pass.
+
+        Args:
+            text: Text to analyze
+            schema: Schema describing tasks and labels
+
+        Returns:
+            ExtractionResult with .entities and .classifications
+        """
+        if not text or not text.strip():
+            raise ValueError("Text cannot be empty")
+        schema.validate()
+        return self._extract_chunk([text], schema)[0]
+
+    def extract_batch(
+        self,
+        texts: list[str],
+        schema: Schema,
+        batch_size: int = 8,
+    ) -> list[ExtractionResult]:
+        """
+        Run multi-task extraction over multiple texts.
+
+        Args:
+            texts: List of texts to analyze
+            schema: Schema describing tasks and labels (shared across all texts)
+            batch_size: Number of texts per encoder forward pass
+
+        Returns:
+            List of ExtractionResult, one per input text
+        """
+        if not texts:
+            raise ValueError("Texts cannot be empty")
+        schema.validate()
+        results = []
+        for i in range(0, len(texts), batch_size):
+            results.extend(self._extract_chunk(texts[i : i + batch_size], schema))
+        return results
+
+    def _build_multi_task_schema_prefix(
+        self,
+        schema: Schema,
+    ) -> tuple[list[int], list[int] | None, dict[str, list[int]]]:
+        """Build combined token prefix for all tasks in schema.
+
+        Produces: ( [P] entities ( [E]l1 [E]l2 ) [P] task1 ( [L]a [L]b ) ) [SEP_TEXT]
+
+        Returns:
+            tokens: Full prefix token ids
+            entity_positions: [E] token positions, or None if no entities task
+            classification_positions: {task_name: [[L] token positions]}
+        """
+        p_id = self.special_tokens[TOKEN_P]
+        e_id = self.special_tokens[TOKEN_E]
+        l_id = self.special_tokens[TOKEN_L]
+        sep_id = self.special_tokens[TOKEN_SEP_TEXT]
+        open_ids = self.tokenizer.encode(SCHEMA_OPEN, add_special_tokens=False)
+        close_ids = self.tokenizer.encode(SCHEMA_CLOSE, add_special_tokens=False)
+
+        tokens: list[int] = []
+        tokens.extend(open_ids)
+
+        entity_positions: list[int] | None = None
+        if schema.has_entities:
+            ec = schema._entity_config
+            tokens.append(p_id)
+            tokens.extend(self.tokenizer.encode(NER_TASK_NAME, add_special_tokens=False))
+            tokens.extend(open_ids)
+            entity_positions = []
+            for label in ec.entity_types:  # type: ignore[union-attr]
+                entity_positions.append(len(tokens))
+                tokens.append(e_id)
+                tokens.extend(self.tokenizer.encode(label, add_special_tokens=False))
+            tokens.extend(close_ids)
+
+        classification_positions: dict[str, list[int]] = {}
+        for cc in schema._classification_configs:
+            tokens.append(p_id)
+            tokens.extend(self.tokenizer.encode(cc.task, add_special_tokens=False))
+            tokens.extend(open_ids)
+            positions: list[int] = []
+            for label in cc.labels:
+                positions.append(len(tokens))
+                tokens.append(l_id)
+                tokens.extend(self.tokenizer.encode(label, add_special_tokens=False))
+            tokens.extend(close_ids)
+            classification_positions[cc.task] = positions
+
+        tokens.extend(close_ids)
+        tokens.append(sep_id)
+
+        return tokens, entity_positions, classification_positions
+
+    def _extract_chunk(
+        self,
+        texts: list[str],
+        schema: Schema,
+    ) -> list[ExtractionResult]:
+        """Run one encoder forward pass for all tasks in schema over a chunk of texts."""
+        prefix_tokens, entity_positions, classification_positions = (
+            self._build_multi_task_schema_prefix(schema)
+        )
+        text_start_idx = len(prefix_tokens)
+
+        per_text_meta: list[tuple[list[tuple[int, int]], list[int], int]] = []
+        sequences: list[list[int]] = []
+        for text in texts:
+            word_offsets: list[tuple[int, int]] = []
+            first_token_positions: list[int] = []
+            text_tokens: list[int] = []
+            token_idx = 0
+            for match in WORD_PATTERN.finditer(text.lower()):
+                word_offsets.append((match.start(), match.end()))
+                first_token_positions.append(token_idx)
+                word_toks = self.tokenizer.encode(match.group(), add_special_tokens=False)
+                text_tokens.extend(word_toks)
+                token_idx += len(word_toks)
+            per_text_meta.append((word_offsets, first_token_positions, len(text_tokens)))
+            sequences.append(list(prefix_tokens) + text_tokens)
+
+        batch_hidden = self._encode_batch(sequences)
+
+        # Classification heads
+        classification_results: list[dict[str, dict[str, float]]] = [{} for _ in texts]
+        for cc in schema._classification_configs:
+            l_positions = classification_positions[cc.task]
+            all_label_emb = batch_hidden[:, l_positions, :]
+            flat = all_label_emb.reshape(-1, all_label_emb.shape[-1])
+            all_logits = self.classifier.run(None, {ONNX_HIDDEN_STATE: flat})[0].reshape(
+                len(texts), len(cc.labels)
+            )
+            for i, logits in enumerate(all_logits):
+                if cc.multi_label:
+                    probs = self._sigmoid(logits)
+                    task_result = {
+                        label: float(p)
+                        for label, p in zip(cc.labels, probs, strict=True)
+                        if float(p) >= cc.threshold
+                    }
+                else:
+                    probs = self._softmax(logits)
+                    task_result = {
+                        label: float(p)
+                        for label, p in zip(cc.labels, probs, strict=True)
+                    }
+                    best = max(task_result, key=lambda k: task_result[k])
+                    task_result = {best: task_result[best]}
+                classification_results[i][cc.task] = task_result
+
+        # NER head
+        entity_results: list[list[Entity]] = [[] for _ in texts]
+        if schema.has_entities and entity_positions is not None:
+            ec = schema._entity_config
+            label_emb_0 = batch_hidden[0, entity_positions, :]
+            transformed_labels = self.count_embed.run(
+                None, {ONNX_LABEL_EMBEDDINGS: label_emb_0.astype(np.float32)}
+            )[0]
+
+            SpanData = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+            per_spans: list[SpanData | None] = []
+            for word_offsets, first_token_positions, _ in per_text_meta:
+                num_words = len(word_offsets)
+                if num_words == 0:
+                    per_spans.append(None)
+                else:
+                    wss, wse = self._generate_spans(num_words)
+                    tss = np.array([first_token_positions[j] for j in wss], dtype=np.int64)
+                    tse = np.array([first_token_positions[j] for j in wse], dtype=np.int64)
+                    per_spans.append((wss, wse, tss, tse))
+
+            valid = [(i, s) for i, s in enumerate(per_spans) if s is not None]
+            if valid:
+                max_text_tokens = max(per_text_meta[i][2] for i, _ in valid)
+                max_num_spans = max(len(s[2]) for _, s in valid)
+                hidden_size = batch_hidden.shape[-1]
+
+                padded_text_hidden = np.zeros(
+                    (len(texts), max_text_tokens, hidden_size), dtype=np.float32
+                )
+                padded_span_start = np.zeros((len(texts), max_num_spans), dtype=np.int64)
+                padded_span_end = np.zeros((len(texts), max_num_spans), dtype=np.int64)
+
+                for i, (_, _, tss, tse) in valid:
+                    _, _, num_text_tokens = per_text_meta[i]
+                    padded_text_hidden[i, :num_text_tokens] = batch_hidden[
+                        i, text_start_idx : text_start_idx + num_text_tokens
+                    ]
+                    padded_span_start[i, : len(tss)] = tss
+                    padded_span_end[i, : len(tse)] = tse
+
+                all_span_rep = self._get_span_rep(
+                    padded_text_hidden, padded_span_start, padded_span_end
+                )
+                all_scores = self._sigmoid(
+                    np.einsum("bsh,lh->bsl", all_span_rep, transformed_labels)
+                )
+
+                for i, (text, (word_offsets, _, _)) in enumerate(zip(texts, per_text_meta)):
+                    if per_spans[i] is None:
+                        continue
+                    wss, wse, tss, _ = per_spans[i]
+                    scores = all_scores[i, : len(tss)]
+                    entities = self._collect_entities(
+                        scores, wss, wse, word_offsets, ec.entity_types, text, ec.threshold  # type: ignore[union-attr]
+                    )
+                    entity_results[i] = self._deduplicate_entities(entities)
+
+        return [
+            ExtractionResult(
+                entities=entity_results[i],
+                classifications=classification_results[i],
+            )
+            for i in range(len(texts))
+        ]
 
     def _build_ner_input(
         self,

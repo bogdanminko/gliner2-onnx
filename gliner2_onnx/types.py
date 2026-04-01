@@ -38,3 +38,17 @@ class Entity:
     start: int
     end: int
     score: float
+
+
+@dataclass
+class ExtractionResult:
+    """Result of a multi-task schema extraction.
+
+    Attributes:
+        entities: Extracted named entities (empty list when no entities task configured)
+        classifications: Dict mapping task name -> {label: score}.
+                         Empty dict when no classification tasks configured.
+    """
+
+    entities: list[Entity]
+    classifications: dict[str, dict[str, float]]
