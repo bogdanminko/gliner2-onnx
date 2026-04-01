@@ -68,8 +68,13 @@ class UnrolledCountEmbed(nn.Module):
         pos_0 = count_embed.pos_embedding.weight[0].data  # (hidden_size,)
         self.pos_0 = nn.Parameter(pos_0, requires_grad=False)
 
-        # Copy the projector (MLP: Linear -> ReLU -> Linear)
-        self.projector = count_embed.projector
+        # CountLSTM uses projector (MLP on concat), CountLSTMv2 uses transformer (on sum)
+        if hasattr(count_embed, "projector"):
+            self.projector = count_embed.projector
+            self.transformer = None
+        else:
+            self.projector = None
+            self.transformer = count_embed.transformer
 
     def forward(self, label_embeddings: torch.Tensor) -> torch.Tensor:
         """
@@ -81,29 +86,21 @@ class UnrolledCountEmbed(nn.Module):
         Returns:
             (num_labels, hidden_size) - transformed embeddings for scoring
         """
-        # h = label_embeddings, x = pos_0 (broadcast over labels)
         h = label_embeddings  # (M, D)
         x = self.pos_0  # (D,)
 
-        # Compute GRU gates for all labels at once (x broadcasts over M labels)
-        # Update gate: z = sigmoid(W_iz @ x + b_iz + W_hz @ h + b_hz)
         z = torch.sigmoid(torch.matmul(x, self.W_iz.t()) + self.b_iz + torch.matmul(h, self.W_hz.t()) + self.b_hz)
-
-        # Reset gate: r = sigmoid(W_ir @ x + b_ir + W_hr @ h + b_hr)
         r = torch.sigmoid(torch.matmul(x, self.W_ir.t()) + self.b_ir + torch.matmul(h, self.W_hr.t()) + self.b_hr)
-
-        # New gate: n = tanh(W_in @ x + b_in + r * (W_hn @ h + b_hn))
         n = torch.tanh(torch.matmul(x, self.W_in.t()) + self.b_in + r * (torch.matmul(h, self.W_hn.t()) + self.b_hn))
-
-        # Combine gates to compute new hidden state
         h_new = (1 - z) * n + z * h  # (M, D)
 
-        # Projector expects concatenation of GRU output and original embeddings
-        # Original shape was (gold_count_val, M, hidden_size) for both
-        # For count=1, we have (1, M, D), squeeze to (M, D)
-        combined = torch.cat([h_new, h], dim=-1)  # (M, 2D)
-
-        return self.projector(combined)  # (M, D)
+        if self.projector is not None:
+            # CountLSTM: concat GRU output + original, then MLP
+            return self.projector(torch.cat([h_new, h], dim=-1))  # (M, D)
+        else:
+            # CountLSTMv2: sum GRU output + original, then transformer
+            combined = (h_new + h).unsqueeze(0)  # (1, M, D)
+            return self.transformer(combined).squeeze(0)  # (M, D)
 
 
 def verify_unrolled(
@@ -171,20 +168,37 @@ def export_count_embed_unrolled(model_name: str, save_path: Path, opset: int = 1
     num_labels = 10
     dummy_input = torch.randn(num_labels, hidden_size)
 
-    torch.onnx.export(
-        unrolled,
-        dummy_input,
-        str(onnx_path),
-        input_names=["label_embeddings"],
-        output_names=["transformed_embeddings"],
-        dynamic_axes={
-            "label_embeddings": {0: "num_labels"},
-            "transformed_embeddings": {0: "num_labels"},
-        },
-        opset_version=opset,
-        do_constant_folding=True,
-        dynamo=False,
-    )
+    # CountLSTMv2 uses a transformer whose internal attention Reshape gets hardcoded
+    # by the TorchScript tracer (dynamo=False) — tgt_len is baked in as a constant.
+    # dynamo=True uses torch.export which maintains symbolic shapes throughout.
+    uses_transformer = unrolled.transformer is not None
+    if uses_transformer:
+        num_labels_dim = torch.export.Dim("num_labels", min=2)
+        torch.onnx.export(
+            unrolled,
+            (dummy_input,),
+            str(onnx_path),
+            input_names=["label_embeddings"],
+            output_names=["transformed_embeddings"],
+            dynamic_shapes={"label_embeddings": {0: num_labels_dim}},
+            opset_version=opset,
+            dynamo=True,
+        )
+    else:
+        torch.onnx.export(
+            unrolled,
+            dummy_input,
+            str(onnx_path),
+            input_names=["label_embeddings"],
+            output_names=["transformed_embeddings"],
+            dynamic_axes={
+                "label_embeddings": {0: "num_labels"},
+                "transformed_embeddings": {0: "num_labels"},
+            },
+            opset_version=opset,
+            do_constant_folding=True,
+            dynamo=False,
+        )
 
     print(f"✓ Exported to {onnx_path}")
 
@@ -210,25 +224,37 @@ def export_count_embed_unrolled(model_name: str, save_path: Path, opset: int = 1
 
 
 def quantize_count_embed(onnx_path: Path, variants: list[str]) -> list[Path]:
-    """Create quantized variants of count_embed (fp16 only)."""
-    import onnx
-    from onnxruntime.transformers.float16 import convert_float_to_float16
-
+    """Create quantized variants of count_embed (fp16, int8)."""
     created: list[Path] = []
     stem = onnx_path.stem
     parent = onnx_path.parent
 
     for variant in variants:
-        if variant == "fp16":
+        if variant == "int8":
+            from onnxruntime.quantization import QuantType, quantize_dynamic
+
+            quantized_path = parent / f"{stem}_int8.onnx"
             try:
-                quantized_path = parent / f"{stem}_fp16.onnx"
+                print(f"  Converting to INT8 (dynamic): {quantized_path.name}")
+                quantize_dynamic(
+                    model_input=str(onnx_path),
+                    model_output=str(quantized_path),
+                    weight_type=QuantType.QInt8,
+                )
+                created.append(quantized_path)
+            except Exception as e:
+                print(f"  ⚠ Failed to convert to INT8: {e}")
+        elif variant == "fp16":
+            import onnx
+            from onnxruntime.transformers.float16 import convert_float_to_float16
+
+            quantized_path = parent / f"{stem}_fp16.onnx"
+            try:
                 print(f"  Converting to FP16: {quantized_path.name}")
 
-                # Load model (includes external data if present)
                 onnx_model = onnx.load(str(onnx_path), load_external_data=True)
                 model_fp16 = convert_float_to_float16(onnx_model, keep_io_types=True)
 
-                # Check if original had external data (large model)
                 original_data_file = onnx_path.with_suffix(".onnx.data")
                 if original_data_file.exists():
                     onnx.save_model(

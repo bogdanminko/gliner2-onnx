@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import onnxruntime as ort
@@ -59,6 +60,7 @@ class GLiNER2ONNXRuntime:
         *,
         precision: Precision = "fp32",
         providers: list[str] | None = None,
+        provider_options: list[dict[str, Any]] | None = None,
         revision: str | None = None,
     ) -> "GLiNER2ONNXRuntime":
         """
@@ -72,6 +74,9 @@ class GLiNER2ONNXRuntime:
             providers: ONNX execution providers (e.g., ["CUDAExecutionProvider"]).
                       Defaults to ["CPUExecutionProvider"].
                       Use onnxruntime.get_available_providers() to see available options.
+            provider_options: Per-provider options, one dict per entry in providers.
+                      E.g., [{"trt_engine_cache_enable": True, "trt_engine_cache_path": "/tmp/trt"}]
+                      for TensorrtExecutionProvider.
             revision: Model revision (branch, tag, or commit hash)
             cache_dir: Directory to cache downloaded models
 
@@ -110,13 +115,14 @@ class GLiNER2ONNXRuntime:
             allow_patterns=allow_patterns,
         )
 
-        return cls(model_path, precision=precision, providers=providers)
+        return cls(model_path, precision=precision, providers=providers, provider_options=provider_options)
 
     def __init__(
         self,
         model_path: str | Path,
         precision: Precision = "fp32",
         providers: list[str] | None = None,
+        provider_options: list[dict[str, Any]] | None = None,
     ):
         """
         Initialize GLiNER2 ONNX runtime from a local directory.
@@ -127,6 +133,9 @@ class GLiNER2ONNXRuntime:
             providers: ONNX execution providers (e.g., ["CUDAExecutionProvider"]).
                       Defaults to ["CPUExecutionProvider"].
                       Use onnxruntime.get_available_providers() to see available options.
+            provider_options: Per-provider options, one dict per entry in providers.
+                      E.g., [{"trt_engine_cache_enable": True, "trt_engine_cache_path": "/tmp/trt"}]
+                      for TensorrtExecutionProvider.
 
         Raises:
             ModelNotFoundError: If required model files are missing
@@ -146,7 +155,7 @@ class GLiNER2ONNXRuntime:
 
         if providers is None:
             providers = ["CPUExecutionProvider"]
-        self._load_onnx_models(onnx_files, providers)
+        self._load_onnx_models(onnx_files, providers, provider_options)
 
         self.tokenizer = AutoTokenizer.from_pretrained(str(self.model_path))
 
@@ -206,18 +215,18 @@ class GLiNER2ONNXRuntime:
             onnx_files=onnx_files_raw,
         )
 
-    def _load_onnx_models(self, onnx_files: OnnxModelFiles, providers: list[str]) -> None:
+    def _load_onnx_models(self, onnx_files: OnnxModelFiles, providers: list[str], provider_options: list[dict[str, Any]] | None) -> None:
         """Load all ONNX model files using paths from config."""
-        self.encoder = self._load_model(self.model_path / onnx_files["encoder"], providers)
-        self.classifier = self._load_model(self.model_path / onnx_files["classifier"], providers)
-        self.span_rep = self._load_model(self.model_path / onnx_files["span_rep"], providers)
-        self.count_embed = self._load_model(self.model_path / onnx_files["count_embed"], providers)
+        self.encoder = self._load_model(self.model_path / onnx_files["encoder"], providers, provider_options)
+        self.classifier = self._load_model(self.model_path / onnx_files["classifier"], providers, provider_options)
+        self.span_rep = self._load_model(self.model_path / onnx_files["span_rep"], providers, provider_options)
+        self.count_embed = self._load_model(self.model_path / onnx_files["count_embed"], providers, provider_options)
 
-    def _load_model(self, path: Path, providers: list[str]) -> ort.InferenceSession:
+    def _load_model(self, path: Path, providers: list[str], provider_options: list[dict[str, Any]] | None) -> ort.InferenceSession:
         """Load a single ONNX model."""
         if not path.exists():
             raise ModelNotFoundError(f"Model not found: {path}")
-        return ort.InferenceSession(str(path), providers=providers)
+        return ort.InferenceSession(str(path), providers=providers, provider_options=provider_options)
 
     def classify_batch(
         self,

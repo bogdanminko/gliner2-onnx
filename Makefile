@@ -29,6 +29,8 @@ clean:
 #   make onnx-export                                    # fp32 only
 #   make onnx-export MODEL=fastino/gliner2-multi-v1    # Custom model
 #   make onnx-export QUANTIZE=fp16                     # fp32 + fp16
+#   make onnx-export QUANTIZE=int8                     # fp32 + int8
+#   make onnx-export QUANTIZE="fp16 int8"              # fp32 + fp16 + int8
 onnx-export:
 	@echo "Exporting $(MODEL) to ONNX..."
 	@MODEL_NAME=$$(basename "$(MODEL)") && \
