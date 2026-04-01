@@ -219,6 +219,78 @@ class GLiNER2ONNXRuntime:
             raise ModelNotFoundError(f"Model not found: {path}")
         return ort.InferenceSession(str(path), providers=providers)
 
+    def classify_batch(
+        self,
+        texts: list[str],
+        labels: list[str],
+        threshold: float = 0.5,
+        batch_size: int = 8,
+        *,
+        multi_label: bool = False,
+    ) -> list[dict[str, float]]:
+        """
+        Classify multiple texts into one or more categories.
+
+        Args:
+            texts: List of texts to classify
+            labels: Candidate labels (same for all texts)
+            threshold: Minimum score threshold (for multi_label mode)
+            batch_size: Number of texts to encode in a single forward pass
+            multi_label: If True, return all labels above threshold;
+                        if False, return only the best label
+
+        Returns:
+            List of dicts mapping label(s) to score(s), one per input text
+        """
+        if not texts:
+            raise ValueError("Texts cannot be empty")
+        if not labels:
+            raise ValueError("Labels cannot be empty")
+
+        results = []
+        for i in range(0, len(texts), batch_size):
+            chunk = texts[i : i + batch_size]
+            results.extend(self._classify_chunk(chunk, labels, threshold, multi_label=multi_label))
+        return results
+
+    def _classify_chunk(
+        self,
+        texts: list[str],
+        labels: list[str],
+        threshold: float,
+        *,
+        multi_label: bool,
+    ) -> list[dict[str, float]]:
+        prefix_tokens, label_positions = self._build_schema_prefix(CLASSIFICATION_TASK_NAME, labels, TOKEN_L)
+
+        sequences = []
+        for text in texts:
+            tokens = list(prefix_tokens)
+            for match in WORD_PATTERN.finditer(text.lower()):
+                tokens.extend(self.tokenizer.encode(match.group(), add_special_tokens=False))
+            sequences.append(tokens)
+
+        batch_hidden = self._encode_batch(sequences)
+
+        # [batch, num_labels, hidden] → [batch*num_labels, hidden] → one classifier call
+        all_label_embeddings = batch_hidden[:, label_positions, :]
+        flat = all_label_embeddings.reshape(-1, all_label_embeddings.shape[-1])
+        all_logits = self.classifier.run(None, {ONNX_HIDDEN_STATE: flat})[0].reshape(len(texts), len(labels))
+
+        results = []
+        for i, logits in enumerate(all_logits):
+            if multi_label:
+                probs = self._sigmoid(logits)
+                result = {label: float(prob) for label, prob in zip(labels, probs, strict=True)}
+                results.append({k: v for k, v in result.items() if v >= threshold})
+            else:
+                probs = self._softmax(logits)
+                result = {label: float(prob) for label, prob in zip(labels, probs, strict=True)}
+                best = max(result, key=lambda k: result[k])
+                results.append({best: result[best]})
+
+        return results
+
     def classify(
         self,
         text: str,
@@ -304,6 +376,119 @@ class GLiNER2ONNXRuntime:
         attention_mask = np.ones_like(input_ids)
 
         return input_ids, attention_mask, label_positions
+
+    def extract_entities_batch(
+        self,
+        texts: list[str],
+        labels: list[str],
+        threshold: float = 0.5,
+        batch_size: int = 8,
+    ) -> list[list[Entity]]:
+        """
+        Extract named entities from multiple texts.
+
+        Args:
+            texts: List of texts to analyze
+            labels: Entity types to extract (same for all texts)
+            threshold: Minimum confidence score
+            batch_size: Number of texts to encode in a single forward pass
+
+        Returns:
+            List of entity lists, one per input text
+        """
+        if not texts:
+            raise ValueError("Texts cannot be empty")
+        if not labels:
+            raise ValueError("Labels cannot be empty")
+
+        results = []
+        for i in range(0, len(texts), batch_size):
+            chunk = texts[i : i + batch_size]
+            results.extend(self._extract_entities_chunk(chunk, labels, threshold))
+        return results
+
+    def _extract_entities_chunk(
+        self,
+        texts: list[str],
+        labels: list[str],
+        threshold: float,
+    ) -> list[list[Entity]]:
+        prefix_tokens, e_positions = self._build_schema_prefix(NER_TASK_NAME, labels, TOKEN_E)
+        text_start_idx = len(prefix_tokens)
+
+        per_text: list[tuple[list[tuple[int, int]], list[int], int]] = []
+        sequences: list[list[int]] = []
+        for text in texts:
+            word_offsets: list[tuple[int, int]] = []
+            first_token_positions: list[int] = []
+            text_tokens: list[int] = []
+            token_idx = 0
+            for match in WORD_PATTERN.finditer(text.lower()):
+                word_offsets.append((match.start(), match.end()))
+                first_token_positions.append(token_idx)
+                word_tokens = self.tokenizer.encode(match.group(), add_special_tokens=False)
+                text_tokens.extend(word_tokens)
+                token_idx += len(word_tokens)
+            per_text.append((word_offsets, first_token_positions, len(text_tokens)))
+            sequences.append(list(prefix_tokens) + text_tokens)
+
+        batch_hidden = self._encode_batch(sequences)
+
+        # count_embed once — same labels for all texts in chunk
+        label_embeddings = batch_hidden[0, e_positions, :]
+        transformed_labels = self.count_embed.run(
+            None, {ONNX_LABEL_EMBEDDINGS: label_embeddings.astype(np.float32)}
+        )[0]
+
+        # Pre-compute spans per text
+        SpanData = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        per_spans: list[SpanData | None] = []
+        for word_offsets, first_token_positions, _ in per_text:
+            num_words = len(word_offsets)
+            if num_words == 0:
+                per_spans.append(None)
+            else:
+                wss, wse = self._generate_spans(num_words)
+                tss = np.array([first_token_positions[j] for j in wss], dtype=np.int64)
+                tse = np.array([first_token_positions[j] for j in wse], dtype=np.int64)
+                per_spans.append((wss, wse, tss, tse))
+
+        valid = [(i, s) for i, s in enumerate(per_spans) if s is not None]
+        if not valid:
+            return [[] for _ in texts]
+
+        # Pad text_hidden and span indices for a single batched span_rep call
+        max_text_tokens = max(per_text[i][2] for i, _ in valid)
+        max_num_spans = max(len(s[2]) for _, s in valid)
+        hidden_size = batch_hidden.shape[-1]
+
+        padded_text_hidden = np.zeros((len(texts), max_text_tokens, hidden_size), dtype=np.float32)
+        padded_span_start = np.zeros((len(texts), max_num_spans), dtype=np.int64)
+        padded_span_end = np.zeros((len(texts), max_num_spans), dtype=np.int64)
+
+        for i, (_, _, tss, tse) in valid:
+            _, _, num_text_tokens = per_text[i]
+            padded_text_hidden[i, :num_text_tokens] = batch_hidden[i, text_start_idx : text_start_idx + num_text_tokens]
+            padded_span_start[i, : len(tss)] = tss
+            padded_span_end[i, : len(tse)] = tse
+
+        # Single span_rep call on the whole batch
+        all_span_rep = self._get_span_rep(padded_text_hidden, padded_span_start, padded_span_end)
+
+        # Batched einsum: [B, max_spans, H] x [L, H] → [B, max_spans, L]
+        all_scores = self._sigmoid(np.einsum("bsh,lh->bsl", all_span_rep, transformed_labels))
+
+        results = []
+        for i, (text, (word_offsets, _, _)) in enumerate(zip(texts, per_text)):
+            if per_spans[i] is None:
+                results.append([])
+                continue
+            wss, wse, tss, _ = per_spans[i]
+            scores = all_scores[i, : len(tss)]
+            entities = self._collect_entities(scores, wss, wse, word_offsets, labels, text, threshold)
+            results.append(self._deduplicate_entities(entities))
+
+        return results
 
     def extract_entities(
         self,
@@ -440,6 +625,21 @@ class GLiNER2ONNXRuntime:
                 kept.append(entity)
 
         return kept
+
+    def _encode_batch(self, sequences: list[list[int]]) -> np.ndarray:
+        """Pad sequences to equal length and run encoder on the full batch."""
+        max_len = max(len(s) for s in sequences)
+        pad_id = self.tokenizer.pad_token_id or 0
+
+        input_ids = np.array(
+            [s + [pad_id] * (max_len - len(s)) for s in sequences],
+            dtype=np.int64,
+        )
+        attention_mask = np.array(
+            [[1] * len(s) + [0] * (max_len - len(s)) for s in sequences],
+            dtype=np.int64,
+        )
+        return self._encode(input_ids, attention_mask)
 
     def _encode(self, input_ids: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
         """Run encoder on inputs."""
