@@ -63,13 +63,14 @@ class GLiNER2ONNXRuntime:
         providers: list[str] | None = None,
         provider_options: list[dict[str, Any]] | None = None,
         revision: str | None = None,
+        session_options: ort.SessionOptions | None = None,
     ) -> "GLiNER2ONNXRuntime":
         """
         Load a GLiNER2 ONNX model from HuggingFace Hub.
 
         Args:
             model_id: HuggingFace model ID (e.g., "lmoe/gliner2-large-v1-onnx")
-            precision: Model precision ("fp32" or "fp16").
+            precision: Model precision ("fp32", "fp16", or "int8").
                       Only downloads the requested precision variant.
                       Available precisions are defined in the model's config.
             providers: ONNX execution providers (e.g., ["CUDAExecutionProvider"]).
@@ -79,7 +80,9 @@ class GLiNER2ONNXRuntime:
                       E.g., [{"trt_engine_cache_enable": True, "trt_engine_cache_path": "/tmp/trt"}]
                       for TensorrtExecutionProvider.
             revision: Model revision (branch, tag, or commit hash)
-            cache_dir: Directory to cache downloaded models
+            session_options: ONNX Runtime session options for performance tuning.
+                      E.g., set intra_op_num_threads, graph_optimization_level,
+                      optimized_model_filepath, execution_mode, etc.
 
         Returns:
             GLiNER2ONNXRuntime instance
@@ -116,7 +119,7 @@ class GLiNER2ONNXRuntime:
             allow_patterns=allow_patterns,
         )
 
-        return cls(model_path, precision=precision, providers=providers, provider_options=provider_options)
+        return cls(model_path, precision=precision, providers=providers, provider_options=provider_options, session_options=session_options)
 
     def __init__(
         self,
