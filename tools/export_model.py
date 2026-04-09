@@ -540,14 +540,31 @@ def quantize_model(onnx_path: Path, quantize_type: str) -> Path | None:
 
     Returns the path to the new quantized file, or None if failed.
     """
-    if quantize_type != "fp16":
+    if quantize_type not in ("fp16", "int8"):
         return None
-
-    import onnx
-    from onnxruntime.transformers.float16 import convert_float_to_float16
 
     stem = onnx_path.stem
     parent = onnx_path.parent
+
+    if quantize_type == "int8":
+        from onnxruntime.quantization import QuantType, quantize_dynamic
+
+        quantized_path = parent / f"{stem}_int8.onnx"
+        try:
+            print(f"  Converting to INT8 (dynamic): {quantized_path.name}")
+            quantize_dynamic(
+                model_input=str(onnx_path),
+                model_output=str(quantized_path),
+                weight_type=QuantType.QInt8,
+            )
+        except Exception as e:
+            print(f"  ⚠ Failed to convert {onnx_path.name} to INT8: {e}")
+            return None
+        else:
+            return quantized_path
+
+    import onnx
+    from onnxruntime.transformers.float16 import convert_float_to_float16
 
     quantized_path = parent / f"{stem}_fp16.onnx"
 
@@ -636,12 +653,12 @@ def main() -> int:
         type=str,
         nargs="*",
         default=[],
-        help="Quantization variants to create: fp16 (e.g., --quantize fp16)",
+        help="Quantization variants to create: fp16, int8 (e.g., --quantize fp16 int8)",
     )
 
     args = parser.parse_args()
 
-    valid_quantize = {"fp16"}
+    valid_quantize = {"fp16", "int8"}
     for q in args.quantize:
         if q not in valid_quantize:
             print(f"Error: Invalid quantize option '{q}'. Valid options: {valid_quantize}")

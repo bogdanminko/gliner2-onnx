@@ -5,7 +5,8 @@ from importlib.metadata import PackageNotFoundError, version
 from .constants import Precision
 from .exceptions import ConfigurationError, GLiNER2Error, ModelNotFoundError
 from .runtime import GLiNER2ONNXRuntime
-from .types import Entity
+from .schema import Schema
+from .types import Entity, ExtractionResult
 
 try:
     __version__ = version("gliner2-onnx")
@@ -15,9 +16,11 @@ except PackageNotFoundError:
 __all__ = [
     "ConfigurationError",
     "Entity",
+    "ExtractionResult",
     "GLiNER2Error",
     "GLiNER2ONNXRuntime",
     "ModelNotFoundError",
     "Precision",
+    "Schema",
     "__version__",
 ]

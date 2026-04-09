@@ -4,7 +4,7 @@ from typing import Final, Literal
 CONFIG_FILE: Final = "config.json"
 GLINER2_CONFIG_FILE: Final = "gliner2_config.json"
 
-Precision = Literal["fp32", "fp16"]
+Precision = Literal["fp32", "fp16", "int8"]
 
 TOKEN_P: Final = "[P]"  # noqa: S105
 TOKEN_L: Final = "[L]"  # noqa: S105
