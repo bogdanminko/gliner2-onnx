@@ -167,7 +167,7 @@ cd gliner2-onnx
 make onnx-export MODEL=fastino/gliner2-large-v1
 
 # FP32 + FP16
-make onnx-export MODEL=fastino/gliner2-large-v1 QUANTIZE=fp16
+make onnx-export hivetrace/gliner-guard-omni QUANTIZE=fp16
 
 # FP32 + INT8
 make onnx-export MODEL=fastino/gliner2-large-v1 QUANTIZE=int8

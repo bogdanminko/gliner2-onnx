@@ -158,6 +158,8 @@ class GLiNER2ONNXRuntime:
         self.max_width = config["max_width"]
         self.special_tokens = config["special_tokens"]
         self.precision = precision
+        self._float_dtype = np.float16 if precision == "fp16" else np.float32
+        self._prefix_cache: dict[Schema, tuple] = {}
 
         onnx_files = _validate_precision(config["onnx_files"], precision)
 
@@ -454,7 +456,7 @@ class GLiNER2ONNXRuntime:
         # count_embed once — same labels for all texts in chunk
         label_embeddings = batch_hidden[0, e_positions, :]
         transformed_labels = self.count_embed.run(
-            None, {ONNX_LABEL_EMBEDDINGS: label_embeddings.astype(np.float32)}
+            None, {ONNX_LABEL_EMBEDDINGS: label_embeddings.astype(self._float_dtype)}
         )[0]
 
         # Pre-compute spans per text
@@ -479,7 +481,7 @@ class GLiNER2ONNXRuntime:
         max_num_spans = max(len(s[2]) for _, s in valid)
         hidden_size = batch_hidden.shape[-1]
 
-        padded_text_hidden = np.zeros((len(texts), max_text_tokens, hidden_size), dtype=np.float32)
+        padded_text_hidden = np.zeros((len(texts), max_text_tokens, hidden_size), dtype=self._float_dtype)
         padded_span_start = np.zeros((len(texts), max_num_spans), dtype=np.int64)
         padded_span_end = np.zeros((len(texts), max_num_spans), dtype=np.int64)
 
@@ -661,9 +663,10 @@ class GLiNER2ONNXRuntime:
         schema: Schema,
     ) -> list[ExtractionResult]:
         """Run one encoder forward pass for all tasks in schema over a chunk of texts."""
-        prefix_tokens, entity_positions, classification_positions = (
-            self._build_multi_task_schema_prefix(schema)
-        )
+        cache_key = self._schema_cache_key(schema)
+        if cache_key not in self._prefix_cache:
+            self._prefix_cache[cache_key] = self._build_multi_task_schema_prefix(schema)
+        prefix_tokens, entity_positions, classification_positions = self._prefix_cache[cache_key]
         text_start_idx = len(prefix_tokens)
 
         per_text_meta: list[tuple[list[tuple[int, int]], list[int], int]] = []
@@ -717,7 +720,7 @@ class GLiNER2ONNXRuntime:
             ec = schema._entity_config
             label_emb_0 = batch_hidden[0, entity_positions, :]
             transformed_labels = self.count_embed.run(
-                None, {ONNX_LABEL_EMBEDDINGS: label_emb_0.astype(np.float32)}
+                None, {ONNX_LABEL_EMBEDDINGS: label_emb_0.astype(self._float_dtype)}
             )[0]
 
             SpanData = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
@@ -739,7 +742,7 @@ class GLiNER2ONNXRuntime:
                 hidden_size = batch_hidden.shape[-1]
 
                 padded_text_hidden = np.zeros(
-                    (len(texts), max_text_tokens, hidden_size), dtype=np.float32
+                    (len(texts), max_text_tokens, hidden_size), dtype=self._float_dtype
                 )
                 padded_span_start = np.zeros((len(texts), max_num_spans), dtype=np.int64)
                 padded_span_end = np.zeros((len(texts), max_num_spans), dtype=np.int64)
@@ -897,7 +900,7 @@ class GLiNER2ONNXRuntime:
         result: np.ndarray = self.span_rep.run(
             None,
             {
-                ONNX_HIDDEN_STATES: hidden_states.astype(np.float32),
+                ONNX_HIDDEN_STATES: hidden_states.astype(self._float_dtype),
                 ONNX_SPAN_START_IDX: span_start,
                 ONNX_SPAN_END_IDX: span_end,
             },
@@ -912,11 +915,21 @@ class GLiNER2ONNXRuntime:
         """Compute similarity scores between spans and labels."""
         transformed_labels = self.count_embed.run(
             None,
-            {ONNX_LABEL_EMBEDDINGS: label_embeddings.astype(np.float32)},
+            {ONNX_LABEL_EMBEDDINGS: label_embeddings.astype(self._float_dtype)},
         )[0]
 
         scores = np.einsum("sh,lh->sl", span_rep, transformed_labels)
         return self._sigmoid(scores)
+
+    @staticmethod
+    def _schema_cache_key(schema: Schema) -> tuple:
+        ec = schema._entity_config
+        entity_key = (tuple(ec.entity_types), ec.threshold) if ec else None
+        class_key = tuple(
+            (cc.task, tuple(cc.labels), cc.threshold, cc.multi_label)
+            for cc in schema._classification_configs
+        )
+        return (entity_key, class_key)
 
     @staticmethod
     def _sigmoid(x: np.ndarray) -> np.ndarray:
